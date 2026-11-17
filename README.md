@@ -47,9 +47,9 @@ This proposal is thus a response to that: rather than representing `externref` v
 
 ## Design
 
-This proposal specifies a boxed `Externref` which, instead of referring to the unsized and unrepresentable `__externref_t`, represents a transparent wrapper around `__externref_t*`, which is fully sized and representable.
+This proposal specifies a boxed externref which, instead of referring to the unsized and unrepresentable `__externref_t`, is built on `externref_ptr`, a raw pointer to a table slot holding the externref, which is fully sized and representable. On top of it, `Externref` is an owned pointer freed on drop and `ExternrefRef<'a>` is a borrowed one, analogous to `RawFd`, `OwnedFd` and `BorrowedFd<'a>`.
 
-To support FFI, `extern "C"` signatures may use a `ByValue<_>` wrapper which acts as an ABI signal that the position is marshalled as `__externref_t` rather than `__externref_t*`. Arguments are `ByValue<ExternrefRef<'_>>` and returns are `ByValue<Externref>`. This is then fully compatible with C and JS linking conventions for proper `externref` passing on the FFI boundary.
+To support FFI, `extern "C"` signatures may use a `ByValue<_>` wrapper which acts as an ABI signal that the position is marshalled as `__externref_t` rather than as a slot pointer. Arguments are `ByValue<ExternrefRef<'_>>` and returns are `ByValue<Externref>`. This is then fully compatible with C and JS linking conventions for proper `externref` passing on the FFI boundary.
 
 The `ByValue<_>` wrapper works by having the compiler emit table operations at the boundary: for an argument, the `externref` is loaded from the borrowed slot with `table.get` and passed by value; for a return, a slot is allocated and the returned `externref` is stored into it with `table.set`.
 
@@ -70,17 +70,19 @@ extern "C" fn greet(s: ByValue<ExternrefRef<'_>>) {
 
 `greet` exports with the Wasm signature `(param externref)` and `log` imports with the same signature; the `externref` is passed through directly.
 
+The by-value positions are marked on the owned and borrowed types rather than on a raw type because the boundary acts on the slots it is given: an argument slot is read, so it must be live for the call, and a returned slot is freed, so it must be uniquely owned. These are a borrow and a transfer of ownership, which `ExternrefRef<'a>` and `Externref` express in the type system, so that functions passing externrefs by value are safe to define and call.
+
 While this approach does incur an overhead over a pure `externref` representation due to these extra table operations, it is exactly the model existing Wasm toolchains such as wasm-bindgen already implement today: a `JsValue` is an index into a JS-side heap table, with a `table.get`/`table.set` on every boundary crossing. Moving that model into the compiler costs nothing new relative to current Rust-to-JS practice, while gaining a C-compatible ABI and compiler visibility into the table operations.
 
-That visibility is what enables optimization. Because slot allocation and free carry the same LLVM attributes as `malloc` and `free`, the existing optimization pipeline removes paired allocations whose slot does not escape, so inlined chains of table store and table load fold away to direct `externref` passing, achieving parity with `__externref_t` marshalling in C.
+That visibility is what enables optimization. Hood Chatham's [LLVM RFC for `__externref_t` pointers](https://discourse.llvm.org/t/rfc-webassembly-externref-t-pointers-in-clang-and-llvm/91914) makes table slots pointers that LLVM understands, with slot allocation and free carrying the same attributes as `malloc` and `free`. The existing optimization pipeline then removes paired allocations whose slot does not escape, so inlined chains of table store and table load fold away to direct `externref` passing, achieving parity with `__externref_t` marshalling in C.
 
 [See the complete proposal here](externref-proposal.md).
 
 ### Tradeoffs
 
-Unlike `__externref_t` which is widely supported in Clang, this proposal is dependent on Hood Chatham's [LLVM RFC for `__externref_t` pointers](https://discourse.llvm.org/t/rfc-webassembly-externref-t-pointers-in-clang-and-llvm/91914), which has not yet been approved.
+The proposal does not depend on new backend support. In a first phase Rust owns the table and its allocator, since `externref_ptr` is opaque and can be represented as a plain table index. This gives complete by-value interop with C and the host, at the cost that existing toolchains pay today.
 
-Without the LLVM RFC, Rust would need to define its own externref table, but then the important optimization passes are not guaranteed without LLVM being aware of the table and its operator semantics.
+The optimizations, and sharing slot pointers with C as `__externref_t*`, depend on the LLVM RFC, which has not yet been approved. Adopting it is a change of representation only, with no change to user code.
 
 ## Next Steps
 
